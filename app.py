@@ -1,4 +1,3 @@
-
 """
 ISOM5240 Group Project — VibeSound
 Background Music Generator for Instagram Reels
@@ -23,10 +22,10 @@ from PIL import Image
 # ============================================================
 
 # IMPORTANT:
-# Replace this with your actual Hugging Face model path after uploading your fine-tuned model.
+# Replace this with your actual Hugging Face model path.
 # Example:
 # FINETUNED_MODEL = "wenxueqing7/distilbert-go-emotions-music"
-FINETUNED_MODEL = "MelodyWEN/distilbert-go-emotions-music"
+FINETUNED_MODEL = "YOUR_HF_USERNAME/distilbert-go-emotions-music"
 
 BLIP_MODEL = "Salesforce/blip-image-captioning-base"
 FLANT5_MODEL = "google/flan-t5-small"
@@ -172,7 +171,7 @@ def load_emotion_classifier():
     return pipeline(
         "text-classification",
         model=FINETUNED_MODEL,
-        return_all_scores=True,
+        top_k=None,
     )
 
 
@@ -199,38 +198,36 @@ def get_hf_client():
     if not token:
         return None
 
-    return InferenceClient(token=token)
+    return InferenceClient(
+        token=token,
+        provider="hf-inference",
+        timeout=120,
+    )
 
 
 # ============================================================
-# ROBUST OUTPUT PARSING
+# OUTPUT PARSING HELPERS
 # ============================================================
 
 def extract_caption(caption_result):
     """
     Robustly extract caption text from different Hugging Face InferenceClient return formats.
-
-    Possible return formats include:
-    - string
-    - dict with generated_text
-    - list of dict
-    - object with generated_text attribute
     """
 
     if caption_result is None:
-        return "a scenic photo"
+        return ""
 
     if isinstance(caption_result, str):
         return caption_result.strip()
 
     if isinstance(caption_result, dict):
-        return str(caption_result.get("generated_text", "a scenic photo")).strip()
+        return str(caption_result.get("generated_text", "")).strip()
 
     if isinstance(caption_result, list) and len(caption_result) > 0:
         first_item = caption_result[0]
 
         if isinstance(first_item, dict):
-            return str(first_item.get("generated_text", "a scenic photo")).strip()
+            return str(first_item.get("generated_text", "")).strip()
 
         if hasattr(first_item, "generated_text"):
             return str(first_item.generated_text).strip()
@@ -261,6 +258,22 @@ def extract_audio_bytes(audio_result):
         return audio_result.content
 
     return audio_result
+
+
+def normalize_classifier_output(raw_scores):
+    """
+    Handles common Hugging Face pipeline output formats:
+    - [[{label, score}, ...]]
+    - [{label, score}, ...]
+    """
+
+    if isinstance(raw_scores, list) and len(raw_scores) > 0:
+        if isinstance(raw_scores[0], list):
+            return raw_scores[0]
+        if isinstance(raw_scores[0], dict):
+            return raw_scores
+
+    return []
 
 
 # ============================================================
@@ -299,7 +312,6 @@ with col_right:
 
 st.markdown("---")
 
-
 generate_btn = st.button(
     "🎵 Generate My Background Music",
     type="primary",
@@ -335,6 +347,9 @@ if generate_btn and uploaded:
         unsafe_allow_html=True,
     )
 
+    caption = "a scenic photo"
+    caption_warning = None
+
     with st.spinner("Reading your photo scene..."):
         try:
             img_bytes = io.BytesIO()
@@ -346,18 +361,27 @@ if generate_btn and uploaded:
                 model=BLIP_MODEL,
             )
 
-            caption = extract_caption(caption_result)
+            extracted_caption = extract_caption(caption_result)
 
-            if not caption:
-                caption = "a scenic photo"
+            if extracted_caption:
+                caption = extracted_caption
+            else:
+                caption_warning = "BLIP returned an empty caption. A fallback caption was used."
+
+        except StopIteration as e:
+            caption_warning = (
+                "BLIP image captioning returned StopIteration from the Hugging Face Inference API. "
+                "A fallback caption was used so the app can continue."
+            )
 
         except Exception as e:
-            st.error(f"Image captioning failed: {type(e).__name__}: {e}")
-            st.info(
-                "Most likely causes: invalid HF_TOKEN, Hugging Face Inference API is busy, "
-                "or the BLIP API returned a format that was not expected."
+            caption_warning = (
+                f"BLIP image captioning failed with {type(e).__name__}: {e}. "
+                "A fallback caption was used so the app can continue."
             )
-            st.stop()
+
+    if caption_warning:
+        st.warning(caption_warning)
 
     st.markdown(
         f'<div class="caption-box">📝 Scene: {caption}</div>',
@@ -378,11 +402,15 @@ if generate_btn and uploaded:
         try:
             if user_text.strip():
                 classifier = load_emotion_classifier()
-                scores = classifier(user_text.strip())[0]
+                raw_scores = classifier(user_text.strip())
+                scores = normalize_classifier_output(raw_scores)
                 scores = sorted(scores, key=lambda x: x["score"], reverse=True)
 
+                if not scores:
+                    raise ValueError("Classifier returned empty scores.")
+
                 top_mood = scores[0]["label"].lower()
-                top_score = scores[0]["score"]
+                top_score = float(scores[0]["score"])
 
             else:
                 top_mood = "neutral"
@@ -453,7 +481,8 @@ if generate_btn and uploaded:
 
         except Exception as e:
             st.warning(
-                f"Prompt builder failed, using fallback prompt instead. Error: {type(e).__name__}: {e}"
+                f"Prompt builder failed with {type(e).__name__}: {e}. "
+                "Using fallback prompt instead."
             )
             music_prompt = MOOD_FALLBACK.get(
                 top_mood,
