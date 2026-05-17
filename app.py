@@ -26,7 +26,7 @@ from PIL import Image
 # Replace this with your actual Hugging Face model path after uploading your fine-tuned model.
 # Example:
 # FINETUNED_MODEL = "wenxueqing7/distilbert-go-emotions-music"
-FINETUNED_MODEL = "YOUR_HF_USERNAME/distilbert-go-emotions-music"
+FINETUNED_MODEL = "MelodyWEN/distilbert-go-emotions-music"
 
 BLIP_MODEL = "Salesforce/blip-image-captioning-base"
 FLANT5_MODEL = "google/flan-t5-small"
