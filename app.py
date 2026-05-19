@@ -34,7 +34,7 @@ FINETUNED_MODEL     = "MelodyWEN7/vibesound-music-mood-classifier"
 
 BLIP_MODEL          = "Salesforce/blip-image-captioning-base"
 FLANT5_MODEL        = "google/flan-t5-small"
-MUSICGEN_MODEL      = "facebook/musicgen-small"
+MUSICGEN_MODEL      = "facebook/musicgen-small"audio_bytes
 
 # ── Placeholder label remapping ──────────────────────────────────────
 # bhadresh model uses: sadness, joy, love, anger, fear, surprise
@@ -313,16 +313,22 @@ if generate_btn and uploaded:
     st.markdown('<p class="step-label">Music Generation — MusicGen-small (HF Inference API)</p>',
                 unsafe_allow_html=True)
 
+    # Replace get_hf_client() with this:
+    def generate_music_api(prompt: str) -> bytes:
+        token = st.secrets.get("HF_TOKEN", "")
+        response = requests.post(
+            f"https://api-inference.huggingface.co/models/{MUSICGEN_MODEL}",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"inputs": prompt},
+            timeout=120,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"API error {response.status_code}: {response.text}")
+        return response.content
+
     with st.spinner("Composing your music clip (20–30 sec)..."):
         try:
-            client = get_hf_client()
-            if client is None:
-                st.error("⚠️ HF_TOKEN not found. Add it under Streamlit Cloud → Settings → Secrets.")
-                st.stop()
-            audio_bytes = client.post(
-                json={"inputs": music_prompt},
-                model=MUSICGEN_MODEL,
-            )
+            audio_bytes = generate_music_api(music_prompt)
         except Exception as e:
             st.error(f"Music generation failed: {e}")
             st.stop()
