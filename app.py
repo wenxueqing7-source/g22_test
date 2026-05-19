@@ -1,98 +1,116 @@
 """
 ISOM5240 Group Project — VibeSound
-Background Music Generator for Instagram Reels
-
-Pipelines (local): BLIP (image→caption), DistilBERT (mood), flan‑t5 (prompt)
-Music Generation: HF Inference API (facebook/musicgen-small)
+Optimised for Streamlit Cloud free tier (1 GB RAM)
+- Image captioning: ViT-GPT2 (small)
+- Mood classifier: DistilRoBERTa emotion (small)
+- Prompt builder: flan-t5-small (8‑bit quantised)
+- Music generation: HF Inference API (no local model)
 """
+import os
+import time
+import tempfile
+import numpy as np
 import streamlit as st
 import requests
-from PIL import Image
-from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration
 import torch
+from PIL import Image
+from transformers import (
+    pipeline,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    BitsAndBytesConfig,
+)
+from huggingface_hub import InferenceClient
 
-# ─────────────────────────────────────────────
-#  CONFIG
-# ─────────────────────────────────────────────
-USE_FINETUNED_MODEL = False
-PLACEHOLDER_MODEL   = "bhadresh-savani/distilbert-base-uncased-emotion"
-FINETUNED_MODEL     = "MelodyWEN7/vibesound-music-mood-classifier"
+# ============================================================
+# CONFIGURATION
+# ============================================================
+# Smaller captioning model
+CAPTION_MODEL = "ydshieh/vit-gpt2-coco-en"
 
-BLIP_MODEL     = "Salesforce/blip-image-captioning-base"
-FLANT5_MODEL   = "google/flan-t5-small"
+# Smaller emotion classifier (distilroberta-base)
+MOOD_MODEL = "j-hartmann/emotion-english-distilroberta-base"
+
+# Prompt builder (flan-t5-small) – will be 8‑bit quantised
+PROMPT_MODEL = "google/flan-t5-small"
+
+# MusicGen via API
 MUSICGEN_MODEL = "facebook/musicgen-small"
 
-PLACEHOLDER_REMAP = {
-    "joy": "happy", "sadness": "sad", "love": "romantic",
-    "anger": "intense", "fear": "intense", "surprise": "surprised",
+# Mood labels from the new model
+MOOD_LABELS = [
+    "anger", "disgust", "fear", "joy", "neutral",
+    "sadness", "surprise"
+]
+# Remap to your original 6 music moods
+MOOD_REMAP = {
+    "joy": "happy", "sadness": "sad", "anger": "intense",
+    "disgust": "intense", "fear": "intense", "surprise": "surprised",
+    "neutral": "neutral"
 }
-FINETUNED_LABELS = ["happy", "sad", "romantic", "intense", "surprised", "neutral"]
 
 MOOD_FALLBACK = {
-    "happy": "upbeat acoustic guitar, bright cheerful, fast tempo, major key",
-    "sad": "slow melancholic piano, minor key, cinematic, emotional",
-    "romantic": "soft romantic acoustic guitar, warm gentle, slow tempo",
-    "intense": "dramatic orchestra, heavy drums, fast, dark, powerful",
-    "surprised": "playful quirky ukulele, bouncy, dynamic, bright",
-    "neutral": "calm ambient background, soft instrumental, peaceful",
+    "happy": "upbeat acoustic guitar, bright cheerful, fast tempo",
+    "sad": "slow melancholic piano, minor key, cinematic",
+    "romantic": "soft romantic acoustic guitar, warm gentle",
+    "intense": "dramatic orchestra, heavy drums, fast, dark",
+    "surprised": "playful quirky ukulele, bouncy, dynamic",
+    "neutral": "calm ambient background, soft instrumental",
 }
 
-MOOD_EMOJI = {"happy":"😊","sad":"😢","romantic":"❤️","intense":"😠","surprised":"😲","neutral":"😐"}
-MOOD_COLOR = {"happy":"#FFD700","sad":"#4A90D9","romantic":"#E91E8C","intense":"#E74C3C","surprised":"#FF6B35","neutral":"#888888"}
+MOOD_EMOJI = {
+    "happy": "😊", "sad": "😢", "romantic": "❤️",
+    "intense": "😠", "surprised": "😲", "neutral": "😐",
+}
+MOOD_COLOR = {
+    "happy": "#FFD700", "sad": "#4A90D9", "romantic": "#E91E8C",
+    "intense": "#E74C3C", "surprised": "#FF6B35", "neutral": "#888888",
+}
 
-# ─────────────────────────────────────────────
-#  PAGE SETUP
-# ─────────────────────────────────────────────
-st.set_page_config(page_title="VibeSound — Reel Music Generator", page_icon="🎵", layout="centered")
+# ============================================================
+# MEMORY OPTIMISATIONS
+# ============================================================
+torch.set_num_threads(1)          # reduce CPU threads
+torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;600;700&display=swap');
-    html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
-    .stApp { background: linear-gradient(135deg, #0D0D0D 0%, #1A0A2E 100%); }
-    .title-text { font-size: 2.6rem; font-weight: 700;
-                  background: linear-gradient(90deg, #E91E8C, #FF6B35);
-                  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-    .subtitle { color: #aaa; font-size: 1rem; margin-top: -8px; }
-    .caption-box { background: rgba(255,255,255,0.04); border-left: 3px solid #E91E8C; padding: 12px; border-radius: 4px; color: #eee; }
-    .prompt-box { background: rgba(255,255,255,0.04); border-left: 3px solid #FF6B35; padding: 12px; border-radius: 4px; color: #eee; }
-    .mood-badge { display: inline-block; padding: 6px 18px; border-radius: 30px; font-weight: 600; color: #fff; }
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown('<p class="title-text">🎵 VibeSound</p>', unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Generate background music for your Instagram Reel</p>', unsafe_allow_html=True)
-if not USE_FINETUNED_MODEL:
-    st.warning("⚠️ Running with placeholder emotion model. Set `USE_FINETUNED_MODEL = True` after fine‑tuning.", icon="⚠️")
-st.markdown("---")
-
-# ─────────────────────────────────────────────
-#  MODEL LOADING (cached, local)
-# ─────────────────────────────────────────────
+# ============================================================
+# MODEL LOADING (all local, except MusicGen)
+# ============================================================
 @st.cache_resource(show_spinner=False)
-def load_blip():
-    processor = BlipProcessor.from_pretrained(BLIP_MODEL)
-    model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL, torch_dtype=torch.float16)
+def load_captioner():
+    """ViT-GPT2 captioning – ~600MB"""
+    from transformers import VisionEncoderDecoderModel, ViTImageProcessor, AutoTokenizer
+    processor = ViTImageProcessor.from_pretrained(CAPTION_MODEL)
+    model = VisionEncoderDecoderModel.from_pretrained(CAPTION_MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(CAPTION_MODEL)
     model.eval()
-    return processor, model
+    return processor, model, tokenizer
 
 @st.cache_resource(show_spinner=False)
-def load_emotion_classifier():
-    model_name = FINETUNED_MODEL if USE_FINETUNED_MODEL else PLACEHOLDER_MODEL
-    return pipeline("text-classification", model=model_name, top_k=None)
+def load_mood_classifier():
+    """DistilRoBERTa emotion – ~300MB"""
+    return pipeline(
+        "text-classification",
+        model=MOOD_MODEL,
+        top_k=None,
+        device=-1,  # CPU
+    )
 
 @st.cache_resource(show_spinner=False)
 def load_prompt_builder():
-    return pipeline("text2text-generation", model=FLANT5_MODEL, max_new_tokens=40)
+    """flan-t5-small in 8‑bit – ~150MB"""
+    bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+    tokenizer = AutoTokenizer.from_pretrained(PROMPT_MODEL)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        PROMPT_MODEL,
+        quantization_config=bnb_config,
+        device_map="auto",
+        low_cpu_mem_usage=True,
+    )
+    return tokenizer, model
 
-def normalise_mood(label: str) -> str:
-    label = label.lower()
-    if USE_FINETUNED_MODEL:
-        return label if label in FINETUNED_LABELS else "neutral"
-    return PLACEHOLDER_REMAP.get(label, "neutral")
-
-# ── Music generation via HF Inference API (no local MusicGen) ──
 def generate_music_api(prompt: str, token: str) -> bytes:
+    """Call HF Inference API for MusicGen"""
     response = requests.post(
         f"https://router.huggingface.co/hf-inference/models/{MUSICGEN_MODEL}",
         headers={"Authorization": f"Bearer {token}"},
@@ -103,138 +121,129 @@ def generate_music_api(prompt: str, token: str) -> bytes:
         raise RuntimeError(f"API error {response.status_code}: {response.text}")
     return response.content
 
-# ─────────────────────────────────────────────
-#  SIDEBAR (no local MusicGen info)
-# ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("### 🎵 Music Generation")
-    if "HF_TOKEN" not in st.secrets:
-        st.error("❌ `HF_TOKEN` not found in Streamlit secrets.\nAdd it in **Settings → Secrets**")
-    else:
-        st.success("✅ Using HF Inference API – no local MusicGen, stays under 1 GB RAM.")
-    st.markdown("---")
-    st.markdown("### 🔬 Pipelines (local)")
-    st.success("✅ BLIP (image→caption) – float16")
-    st.success("✅ DistilBERT (caption→mood)")
-    st.success("✅ flan‑t5‑small (mood→prompt)")
-    st.markdown("---")
-    st.markdown("### 🎭 Mood Classes")
-    for mood, em in MOOD_EMOJI.items():
-        st.markdown(f"{em} **{mood.capitalize()}**")
-    st.caption("ISOM5240 Group Project · HuggingFace 🤗")
+def normalise_mood(label: str) -> str:
+    label = label.lower()
+    return MOOD_REMAP.get(label, "neutral")
 
-# ─────────────────────────────────────────────
-#  MAIN UI
-# ─────────────────────────────────────────────
+# ============================================================
+# UI
+# ============================================================
+st.set_page_config(page_title="VibeSound – Light", page_icon="🎵", layout="centered")
+
+st.markdown("""
+<style>
+    .stApp { background: linear-gradient(135deg, #0D0D0D, #1A0A2E); }
+    .title-text { font-size: 2.5rem; font-weight: 700;
+                  background: linear-gradient(90deg, #E91E8C, #FF6B35);
+                  -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+    .caption-box, .prompt-box { background: rgba(255,255,255,0.05); padding: 12px;
+                                 border-radius: 8px; margin: 10px 0; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown('<p class="title-text">🎵 VibeSound (Light)</p>', unsafe_allow_html=True)
+st.markdown("Optimised for 1 GB RAM – all pipelines local, MusicGen via API.")
+
 col_left, col_right = st.columns(2)
-
 with col_left:
-    st.markdown("#### 📸 Upload your reel photo")
-    uploaded = st.file_uploader("Photo required", type=["jpg","jpeg","png"], label_visibility="collapsed")
+    uploaded = st.file_uploader("📸 Upload reel photo", type=["jpg","png","jpeg"])
     if uploaded:
         image = Image.open(uploaded).convert("RGB")
         st.image(image, use_container_width=True)
-
 with col_right:
-    st.markdown("#### 💬 Describe your vibe (optional)")
-    user_text = st.text_area("", placeholder="e.g. missing summer so much...\nbest day ever with my girls", height=160, label_visibility="collapsed")
+    user_text = st.text_area("💬 Describe your vibe (optional)", height=120,
+                             placeholder="e.g. missing summer... best day ever...")
     st.caption("Leave empty → neutral mood")
 
-st.markdown("---")
-generate_btn = st.button("🎵 Generate Background Music", type="primary", disabled=(uploaded is None), use_container_width=True)
-if uploaded is None:
-    st.caption("⬆️ Upload a photo to activate")
+if st.button("🎵 Generate Music", type="primary", disabled=(uploaded is None), use_container_width=True):
+    if uploaded is None:
+        st.stop()
 
-# ─────────────────────────────────────────────
-#  GENERATION PIPELINE
-# ─────────────────────────────────────────────
-if generate_btn and uploaded:
-    # 1. BLIP captioning
+    # ---------- 1. Captioning ----------
     st.markdown("---")
-    st.markdown('<p class="step-label">★ Pipeline 1 — image captioning (BLIP)</p>', unsafe_allow_html=True)
-    with st.spinner("Reading your photo..."):
+    st.markdown("**📝 1. Captioning photo (ViT-GPT2)**")
+    with st.spinner("..."):
         try:
-            processor, blip_model = load_blip()
-            inputs = processor(image, return_tensors="pt")
-            out = blip_model.generate(**inputs, max_new_tokens=50)
-            caption = processor.decode(out[0], skip_special_tokens=True)
+            processor, caption_model, tokenizer = load_captioner()
+            pixel_values = processor(images=image, return_tensors="pt").pixel_values
+            output_ids = caption_model.generate(pixel_values, max_length=50, num_beams=4)
+            caption = tokenizer.decode(output_ids[0], skip_special_tokens=True)
         except Exception as e:
-            st.error(f"Captioning failed: {e}")
             caption = "a scenic photo"
-            st.warning("Using fallback caption.")
-    st.markdown(f'<div class="caption-box">📝 Scene: {caption}</div>', unsafe_allow_html=True)
+            st.warning(f"Caption fallback: {e}")
+    st.markdown(f'<div class="caption-box">📷 {caption}</div>', unsafe_allow_html=True)
 
-    # 2. Emotion classification
-    st.markdown(" ")
-    st.markdown('<p class="step-label">★ Pipeline 2 — mood detection</p>', unsafe_allow_html=True)
-    with st.spinner("Detecting mood..."):
+    # ---------- 2. Mood detection ----------
+    st.markdown("**🎭 2. Detecting mood (DistilRoBERTa)**")
+    with st.spinner("..."):
         try:
             if user_text.strip():
-                classifier = load_emotion_classifier()
-                raw_scores = classifier(user_text.strip())[0]
-                raw_scores.sort(key=lambda x: x["score"], reverse=True)
-                top_mood = normalise_mood(raw_scores[0]["label"])
-                top_score = raw_scores[0]["score"]
-                from collections import defaultdict
-                merged = defaultdict(float)
-                for s in raw_scores:
-                    merged[normalise_mood(s["label"])] += s["score"]
-                display_scores = sorted(merged.items(), key=lambda x: -x[1])
+                classifier = load_mood_classifier()
+                raw = classifier(user_text.strip())[0]
+                raw.sort(key=lambda x: x["score"], reverse=True)
+                top_label = raw[0]["label"]
+                top_score = raw[0]["score"]
+                top_mood = normalise_mood(top_label)
             else:
                 top_mood, top_score = "neutral", 1.0
-                display_scores = [("neutral", 1.0)]
         except Exception as e:
-            st.error(f"Mood detection failed: {e}")
+            st.error(f"Mood error: {e}")
             st.stop()
 
     emoji, color = MOOD_EMOJI.get(top_mood, "🎶"), MOOD_COLOR.get(top_mood, "#888")
-    col_mood, col_chart = st.columns([1,2])
-    with col_mood:
-        st.markdown(f'<div class="mood-badge" style="background:{color};">{emoji} {top_mood.capitalize()}</div>', unsafe_allow_html=True)
-        st.caption(f"Confidence: {top_score*100:.1f}%")
-        if not user_text.strip():
-            st.caption("*(no text → neutral)*")
-    with col_chart:
-        if user_text.strip():
-            top3 = {k.capitalize(): round(v,3) for k,v in display_scores[:3]}
-            st.bar_chart(top3, height=100)
+    st.markdown(f'<div style="background:{color}; display:inline-block; padding:5px 15px; border-radius:30px;">{emoji} {top_mood.capitalize()} ({top_score*100:.1f}%)</div>', unsafe_allow_html=True)
 
-    # 3. Prompt building with flan-t5
-    st.markdown(" ")
-    st.markdown('<p class="step-label">★ Pipeline 3 — music prompt (flan‑t5)</p>', unsafe_allow_html=True)
-    with st.spinner("Building music prompt..."):
+    # ---------- 3. Prompt building (8‑bit flan-t5) ----------
+    st.markdown("**✍️ 3. Building music prompt (flan-t5-small 8‑bit)**")
+    with st.spinner("..."):
         try:
-            prompt_builder = load_prompt_builder()
-            instruction = f"Generate background music keywords for an Instagram reel. Scene: {caption}. Mood: {top_mood}. Output comma-separated keywords only, max 15 words."
-            raw_output = prompt_builder(instruction)[0]["generated_text"].strip()
-            music_prompt = raw_output if raw_output and len(raw_output.split()) <= 20 else MOOD_FALLBACK.get(top_mood, "calm ambient music")
-        except Exception:
+            tokenizer, prompt_model = load_prompt_builder()
+            instruction = (
+                f"Generate background music keywords for an Instagram reel. "
+                f"Scene: {caption}. Mood: {top_mood}. "
+                f"Output comma-separated keywords only, max 15 words."
+            )
+            inputs = tokenizer(instruction, return_tensors="pt", truncation=True, max_length=128)
+            outputs = prompt_model.generate(**inputs, max_new_tokens=40)
+            music_prompt = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+            if not music_prompt or len(music_prompt.split()) > 20:
+                music_prompt = MOOD_FALLBACK.get(top_mood, "calm ambient music")
+        except Exception as e:
             music_prompt = MOOD_FALLBACK.get(top_mood, "calm ambient music")
-    st.markdown(f'<div class="prompt-box">🎼 Music prompt: {music_prompt}</div>', unsafe_allow_html=True)
+            st.warning(f"Prompt fallback: {e}")
+    st.markdown(f'<div class="prompt-box">🎼 {music_prompt}</div>', unsafe_allow_html=True)
 
-    # 4. Music generation via HF API
-    st.markdown(" ")
-    st.markdown('<p class="step-label">🎵 Music Generation (HF Inference API)</p>', unsafe_allow_html=True)
+    # ---------- 4. Music generation via API ----------
+    st.markdown("**🎶 4. Generating music (HF API – MusicGen-small)**")
     if "HF_TOKEN" not in st.secrets:
-        st.error("Cannot generate music: `HF_TOKEN` missing from secrets.\nAdd it in the sidebar settings.")
+        st.error("Missing `HF_TOKEN` in secrets. Please add it.")
         st.stop()
 
-    with st.spinner("Composing your music clip (20–30 seconds)..."):
+    with st.spinner("Composing (20‑30 sec)..."):
         try:
             audio_bytes = generate_music_api(music_prompt, st.secrets["HF_TOKEN"])
         except Exception as e:
-            st.error(f"Music generation failed: {e}")
-            st.info("Check that your Hugging Face token is valid and has access to facebook/musicgen-small.")
+            st.error(f"MusicGen API failed: {e}")
             st.stop()
 
-    st.success("✅ Music generated!")
+    st.success("✅ Music ready!")
     st.audio(audio_bytes, format="audio/wav")
-    st.download_button(label="⬇️ Download WAV", data=audio_bytes, file_name=f"vibesound_{top_mood}.wav", mime="audio/wav", use_container_width=True)
+    st.download_button("⬇️ Download WAV", data=audio_bytes, file_name=f"vibesound_{top_mood}.wav", mime="audio/wav")
 
     # Summary
     st.markdown("---")
-    st.markdown("### 📊 Generation Summary")
-    st.markdown(f"**Scene:** {caption}")
-    st.markdown(f"**Your text:** {user_text.strip() if user_text.strip() else '*(none)*'}")
-    st.markdown(f"**Detected mood:** {emoji} {top_mood.capitalize()} ({top_score*100:.1f}%)")
-    st.markdown(f"**Music prompt:** {music_prompt}")
+    st.markdown("### 📊 Summary")
+    st.markdown(f"**Caption:** {caption}")
+    st.markdown(f"**Mood:** {emoji} {top_mood.capitalize()} ({top_score*100:.1f}%)")
+    st.markdown(f"**Prompt:** {music_prompt}")
+
+# Sidebar info
+with st.sidebar:
+    st.markdown("### 🔧 Optimisations")
+    st.success("✅ ViT-GPT2 captioning (~600MB)")
+    st.success("✅ DistilRoBERTa emotion (~300MB)")
+    st.success("✅ flan-t5-small 8‑bit (~150MB)")
+    st.info("🎵 MusicGen via HF API (0MB local)")
+    st.markdown(f"**Total local RAM ≈ 1.05 GB** – fits free tier")
+    st.markdown("---")
+    st.caption("Add your `HF_TOKEN` in Streamlit secrets for MusicGen API.")
