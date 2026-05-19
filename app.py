@@ -35,7 +35,7 @@ FINETUNED_MODEL     = "MelodyWEN7/vibesound-music-mood-classifier"
 
 BLIP_MODEL          = "Salesforce/blip-image-captioning-base"
 FLANT5_MODEL        = "google/flan-t5-small"
-MUSICGEN_MODEL      = "facebook/musicgen-small"audio_bytes
+MUSICGEN_MODEL      = "facebook/musicgen-small"
 
 # ── Placeholder label remapping ──────────────────────────────────────
 # bhadresh model uses: sadness, joy, love, anger, fear, surprise
