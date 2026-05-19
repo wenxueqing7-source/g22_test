@@ -1,6 +1,7 @@
-torch
-transformers
-streamlit
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+streamlit>=1.25.0
 pillow
 scipy
 numpy
