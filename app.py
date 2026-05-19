@@ -319,7 +319,7 @@ if generate_btn and uploaded:
             if client is None:
                 st.error("⚠️ HF_TOKEN not found. Add it under Streamlit Cloud → Settings → Secrets.")
                 st.stop()
-            audio_bytes = client.text_to_audio(
+            audio_bytes = client.post(
                 json={"inputs": music_prompt},
                 model=MUSICGEN_MODEL,
             )
