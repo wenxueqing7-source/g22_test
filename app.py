@@ -135,6 +135,7 @@ def load_blip():
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     return pipeline(
         model=BLIP_MODEL,
+        task='image-text-to-text',
         torch_dtype=dtype,
     )
 
