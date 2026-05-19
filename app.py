@@ -11,7 +11,7 @@ HuggingFace Pipelines (transformers.pipeline):
 Music Generation (HF Inference API — not a pipeline):
   facebook/musicgen-small
 """
-
+import requests
 import streamlit as st
 from transformers import BlipProcessor, BlipForConditionalGeneration
 from huggingface_hub import InferenceClient
