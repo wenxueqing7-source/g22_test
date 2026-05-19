@@ -134,7 +134,6 @@ def load_blip():
     """
     dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     return pipeline(
-        "image-to-text",
         model=BLIP_MODEL,
         torch_dtype=dtype,
     )
@@ -152,7 +151,7 @@ def load_emotion_classifier():
     return pipeline(
         "text-classification",
         model=model_name,
-        return_all_scores=True,
+        top_k=None,
     )
 
 @st.cache_resource(show_spinner=False)
