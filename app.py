@@ -1,4 +1,3 @@
-
 """
 ISOM5240 Group Project — VibeSound
 Background Music Generator for Instagram Reels
@@ -318,7 +317,7 @@ if generate_btn and uploaded:
     def generate_music_api(prompt: str) -> bytes:
         token = st.secrets.get("HF_TOKEN", "")
         response = requests.post(
-            f"https://api-inference.huggingface.co/models/{MUSICGEN_MODEL}",
+            f"https://router.huggingface.co/hf-inference/models/{MUSICGEN_MODEL}",
             headers={"Authorization": f"Bearer {token}"},
             json={"inputs": prompt},
             timeout=120,
