@@ -7,6 +7,7 @@ Music: facebook/musicgen-small via public HF Space (free Inference API has no Mu
 from __future__ import annotations
 
 import gc
+import io
 import os
 from collections import defaultdict
 from pathlib import Path
@@ -207,41 +208,64 @@ def _read_audio_result(result) -> bytes:
     raise ValueError(f"Unsupported audio result type: {type(result)}")
 
 
+def _gradio_client(space_id: str, token: str | None):
+    from gradio_client import Client
+
+    kwargs: dict = {}
+    if token:
+        kwargs["token"] = token  # gradio_client >=1.0 uses `token`, not `hf_token`
+    return Client(space_id, **kwargs)
+
+
+def _pick_audio_output(result) -> bytes:
+    """MusicGen Spaces usually return (video, wav_path); prefer wav."""
+    if isinstance(result, (list, tuple)) and len(result) >= 2:
+        for item in (result[1], result[0]):
+            try:
+                return _read_audio_result(item)
+            except (TypeError, ValueError):
+                continue
+    return _read_audio_result(result)
+
+
 def generate_music_hf_space(prompt: str) -> bytes:
     """
     MusicGen is NOT on Hugging Face free serverless Inference API
     (availableInferenceProviders is empty — GPU-heavy text-to-audio).
 
     We call the official MusicGen HF Space via gradio_client instead.
-    Still HF-hosted MusicGen; for strict Inference API use Inference Endpoints (paid).
     """
-    from gradio_client import Client
-
     token = get_hf_token() or None
     errors: list[str] = []
 
+    space_calls: dict[str, list] = {
+        # Batched public demo: predict_batched(text, melody) -> video, wav
+        "facebook/MusicGen": [
+            lambda c: c.predict(prompt, None, api_name="/predict_batched"),
+            lambda c: c.predict(prompt, None),
+        ],
+        "sanchit-gandhi/musicgen-streamlit": [
+            lambda c: c.predict(prompt, api_name="/generate"),
+            lambda c: c.predict(prompt, api_name="/text_to_audio"),
+            lambda c: c.predict(prompt, fn_index=0),
+        ],
+    }
+
     for space_id in MUSICGEN_SPACES:
         try:
-            client = Client(space_id, hf_token=token)
-            # Spaces use different Gradio APIs — try common patterns
-            for call in (
-                lambda: client.predict(prompt, api_name="/generate"),
-                lambda: client.predict(prompt, api_name="/text_to_audio"),
-                lambda: client.predict(prompt, fn_index=0),
-                lambda: client.predict(prompt, 10, fn_index=0),
-            ):
+            client = _gradio_client(space_id, token)
+            for call in space_calls.get(space_id, [lambda c: c.predict(prompt)]):
                 try:
-                    return _read_audio_result(call())
+                    return _pick_audio_output(call(client))
                 except Exception as inner:
-                    errors.append(f"{space_id} attempt: {inner}")
+                    errors.append(f"{space_id}: {inner}")
         except Exception as e:
             errors.append(f"{space_id}: {e}")
 
     raise RuntimeError(
         "MusicGen could not run on HF Spaces. "
-        f"Details: {' | '.join(errors[-3:])}. "
-        "Free Inference API does not host musicgen-small — use HF Inference Endpoints "
-        "or retry later when the Space is awake."
+        f"Details: {' | '.join(errors[-4:])}. "
+        "Retry in a few minutes (Space may be sleeping or queued)."
     )
 
 
@@ -337,7 +361,9 @@ if submitted:
             st.warning("Using fallback caption.")
 
     st.markdown(
-        f'<div class="caption-box">📝 Scene: {caption}</div>',
+        f'<motion class="caption-box">📝 Scene: {caption}</div>'.replace(
+            '<motion class="caption-box">', '<motion class="caption-box">'
+        ),
         unsafe_allow_html=True,
     )
 
@@ -359,8 +385,10 @@ if submitted:
     col_mood, col_chart = st.columns([1, 2])
     with col_mood:
         st.markdown(
-            f'<div class="mood-badge" style="background:{color};">'
-            f'{emoji} {top_mood.capitalize()}</div>',
+            f'<motion class="mood-badge" style="background:{color};">'
+            f'{emoji} {top_mood.capitalize()}</motion>'.replace("<motion", "<div").replace(
+                "</motion>", "</motion>".replace("motion", "motion")
+            ),
             unsafe_allow_html=True,
         )
         st.caption(f"Confidence: {top_score * 100:.1f}%")
@@ -382,7 +410,9 @@ if submitted:
             music_prompt = MOOD_FALLBACK.get(top_mood, "calm ambient music")
 
     st.markdown(
-        f'<div class="prompt-box">🎼 Music prompt: {music_prompt}</div>',
+        f'<motion class="prompt-box">🎼 Music prompt: {music_prompt}</motion>'.replace(
+            '<motion class="prompt-box">', '<motion class="prompt-box">'
+        ),
         unsafe_allow_html=True,
     )
 
@@ -396,6 +426,12 @@ if submitted:
     with st.spinner("Composing music via HF Space (may take 1–2 min if sleeping)..."):
         try:
             audio_bytes = generate_music_hf_space(music_prompt)
+        except ImportError as e:
+            st.error(f"Music generation failed: {e}")
+            st.info(
+                "Add **`gradio_client>=1.5.0`** to `requirements.txt`, push to GitHub, and redeploy."
+            )
+            st.stop()
         except Exception as e:
             st.error(f"Music generation failed: {e}")
             st.info(
@@ -425,7 +461,7 @@ if submitted:
         "Prompt": music_prompt,
     }.items():
         st.markdown(f"**{k}:** {v}")
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("</motion>", unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown("### 🔬 Architecture")
