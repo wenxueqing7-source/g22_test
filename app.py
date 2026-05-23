@@ -34,11 +34,8 @@ FINETUNED_MODEL = "MelodyWEN7/vibesound-music-mood-classifier"
 BLIP_MODEL = "Salesforce/blip-image-captioning-base"
 FLANT5_MODEL = "google/flan-t5-small"
 MUSICGEN_MODEL = "facebook/musicgen-small"
-# Public HF Spaces that host MusicGen (free serverless Inference API does not)
-MUSICGEN_SPACES = [
-    "facebook/MusicGen",
-    "sanchit-gandhi/musicgen-streamlit",
-]
+# Public HF Space (free; no paid Inference API). Gradio uses unnamed fn_index=0.
+MUSICGEN_SPACE = "facebook/MusicGen"
 
 PLACEHOLDER_REMAP = {
     "joy": "happy",
@@ -233,40 +230,24 @@ def generate_music_hf_space(prompt: str) -> bytes:
     MusicGen is NOT on Hugging Face free serverless Inference API
     (availableInferenceProviders is empty — GPU-heavy text-to-audio).
 
-    We call the official MusicGen HF Space via gradio_client instead.
+    Uses the public facebook/MusicGen Space (free queue; no paid API key).
+    Endpoint 0: text + optional melody -> (video, wav).
     """
     token = get_hf_token() or None
-    errors: list[str] = []
+    client = _gradio_client(MUSICGEN_SPACE, token)
 
-    space_calls: dict[str, list] = {
-        # Batched public demo: predict_batched(text, melody) -> video, wav
-        "facebook/MusicGen": [
-            lambda c: c.predict(prompt, None, api_name="/predict_batched"),
-            lambda c: c.predict(prompt, None),
-        ],
-        "sanchit-gandhi/musicgen-streamlit": [
-            lambda c: c.predict(prompt, api_name="/generate"),
-            lambda c: c.predict(prompt, api_name="/text_to_audio"),
-            lambda c: c.predict(prompt, fn_index=0),
-        ],
-    }
+    # Space has no named endpoints; fn_index=0 is the Generate button.
+    job = client.submit(prompt, None, fn_index=0)
+    try:
+        result = job.result(timeout=600)
+    except Exception as e:
+        raise RuntimeError(
+            f"{MUSICGEN_SPACE} failed: {e}. "
+            "The Space may be sleeping — wait 1–2 min and retry. "
+            "A free HF_TOKEN in Streamlit secrets can help queue priority (not a paid key)."
+        ) from e
 
-    for space_id in MUSICGEN_SPACES:
-        try:
-            client = _gradio_client(space_id, token)
-            for call in space_calls.get(space_id, [lambda c: c.predict(prompt)]):
-                try:
-                    return _pick_audio_output(call(client))
-                except Exception as inner:
-                    errors.append(f"{space_id}: {inner}")
-        except Exception as e:
-            errors.append(f"{space_id}: {e}")
-
-    raise RuntimeError(
-        "MusicGen could not run on HF Spaces. "
-        f"Details: {' | '.join(errors[-4:])}. "
-        "Retry in a few minutes (Space may be sleeping or queued)."
-    )
+    return _pick_audio_output(result)
 
 
 # ── PAGE ─────────────────────────────────────────────────────────────────────
@@ -435,10 +416,11 @@ if submitted:
         except Exception as e:
             st.error(f"Music generation failed: {e}")
             st.info(
-                "**Why:** `facebook/musicgen-small` is not on Hugging Face free serverless Inference "
-                "(needs GPU; `availableInferenceProviders` is empty). "
-                "**Options:** retry (Space may be cold), add `HF_TOKEN`, or deploy "
-                "[Inference Endpoints](https://huggingface.co/docs/inference-endpoints)."
+                "**No paid API key required** for the public MusicGen Space. "
+                "Add a **free** `HF_TOKEN` in Streamlit secrets (Hub → Settings → Access Tokens) "
+                "for queue priority + your gated mood model. "
+                "Paid [Inference Endpoints](https://huggingface.co/docs/inference-endpoints) "
+                "only if you need a dedicated GPU API."
             )
             st.stop()
 
