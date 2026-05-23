@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import gc
 import io
+import json
 import os
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -34,8 +36,8 @@ FINETUNED_MODEL = "MelodyWEN7/vibesound-music-mood-classifier"
 BLIP_MODEL = "Salesforce/blip-image-captioning-base"
 FLANT5_MODEL = "google/flan-t5-small"
 MUSICGEN_MODEL = "facebook/musicgen-small"
-# Public HF Space (free; no paid Inference API). Gradio uses unnamed fn_index=0.
-MUSICGEN_SPACE = "facebook/MusicGen"
+# Public HF Space (free; no paid Inference API). REST fn_index=0, no WebSockets.
+MUSICGEN_SPACE_URL = "https://facebook-musicgen.hf.space"
 
 PLACEHOLDER_REMAP = {
     "joy": "happy",
@@ -205,13 +207,61 @@ def _read_audio_result(result) -> bytes:
     raise ValueError(f"Unsupported audio result type: {type(result)}")
 
 
-def _gradio_client(space_id: str, token: str | None):
-    from gradio_client import Client
-
-    kwargs: dict = {}
+def _space_headers(token: str | None) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
     if token:
-        kwargs["token"] = token  # gradio_client >=1.0 uses `token`, not `hf_token`
-    return Client(space_id, **kwargs)
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _parse_sse_payload(line: str) -> dict | None:
+    if not line.startswith("data:"):
+        return None
+    raw = line[5:].strip()
+    if not raw:
+        return None
+    return json.loads(raw)
+
+
+def _poll_gradio_call(event_url: str, headers: dict[str, str], timeout: float) -> list:
+    """Poll Gradio queue over HTTP/SSE (no ws:// — avoids 'Unknown protocol: ws' on Cloud)."""
+    deadline = time.monotonic() + timeout
+    last_error = ""
+
+    while time.monotonic() < deadline:
+        with requests.get(event_url, headers=headers, stream=True, timeout=120) as resp:
+            resp.raise_for_status()
+            for raw_line in resp.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                payload = _parse_sse_payload(raw_line)
+                if not payload:
+                    continue
+                msg = payload.get("msg")
+                if msg == "process_completed":
+                    output = payload.get("output") or {}
+                    data = output.get("data")
+                    if data is None:
+                        raise RuntimeError(f"Space returned no data: {output}")
+                    return data
+                if msg == "process_error":
+                    raise RuntimeError(
+                        payload.get("title")
+                        or payload.get("message")
+                        or str(payload)
+                    )
+                if msg in ("queue_full", "process_starts"):
+                    continue
+                if msg == "heartbeat":
+                    continue
+                last_error = str(payload)
+
+        time.sleep(2)
+
+    raise TimeoutError(
+        f"MusicGen Space timed out after {int(timeout)}s"
+        + (f" (last: {last_error})" if last_error else "")
+    )
 
 
 def _pick_audio_output(result) -> bytes:
@@ -225,29 +275,57 @@ def _pick_audio_output(result) -> bytes:
     return _read_audio_result(result)
 
 
+def _start_gradio_job(
+    call_url: str, headers: dict[str, str], prompt: str
+) -> tuple[str, str]:
+    """POST queue job; returns (poll_url, event_id)."""
+    resp = requests.post(
+        call_url,
+        headers=headers,
+        json={"data": [prompt, None]},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    event_id = resp.json()
+    if isinstance(event_id, dict):
+        event_id = event_id.get("event_id")
+    if not event_id:
+        raise RuntimeError(f"Unexpected Space response: {resp.text[:200]}")
+    return f"{call_url}/{event_id}", str(event_id)
+
+
 def generate_music_hf_space(prompt: str) -> bytes:
     """
     MusicGen is NOT on Hugging Face free serverless Inference API
     (availableInferenceProviders is empty — GPU-heavy text-to-audio).
 
-    Uses the public facebook/MusicGen Space (free queue; no paid API key).
+    Uses the public facebook/MusicGen Space via HTTP queue API only (no gradio_client/ws).
     Endpoint 0: text + optional melody -> (video, wav).
     """
     token = get_hf_token() or None
-    client = _gradio_client(MUSICGEN_SPACE, token)
+    headers = _space_headers(token or None)
+    base = MUSICGEN_SPACE_URL
+    # Gradio 4 queue API (fn_index 0); fallback for older Space builds
+    call_candidates = (
+        f"{base}/gradio_api/call/0",
+        f"{base}/call/0",
+        f"{base}/run/0",
+    )
 
-    # Space has no named endpoints; fn_index=0 is the Generate button.
-    job = client.submit(prompt, None, fn_index=0)
-    try:
-        result = job.result(timeout=600)
-    except Exception as e:
-        raise RuntimeError(
-            f"{MUSICGEN_SPACE} failed: {e}. "
-            "The Space may be sleeping — wait 1–2 min and retry. "
-            "A free HF_TOKEN in Streamlit secrets can help queue priority (not a paid key)."
-        ) from e
+    errors: list[str] = []
+    for call_url in call_candidates:
+        try:
+            poll_url, _ = _start_gradio_job(call_url, headers, prompt)
+            data = _poll_gradio_call(poll_url, headers, timeout=600)
+            return _pick_audio_output(data)
+        except Exception as e:
+            errors.append(f"{call_url}: {e}")
 
-    return _pick_audio_output(result)
+    raise RuntimeError(
+        "MusicGen Space unreachable. "
+        + " | ".join(errors[-3:])
+        + " — wait 1–2 min if the Space is cold and retry."
+    )
 
 
 # ── PAGE ─────────────────────────────────────────────────────────────────────
@@ -407,12 +485,6 @@ if submitted:
     with st.spinner("Composing music via HF Space (may take 1–2 min if sleeping)..."):
         try:
             audio_bytes = generate_music_hf_space(music_prompt)
-        except ImportError as e:
-            st.error(f"Music generation failed: {e}")
-            st.info(
-                "Add **`gradio_client>=1.5.0`** to `requirements.txt`, push to GitHub, and redeploy."
-            )
-            st.stop()
         except Exception as e:
             st.error(f"Music generation failed: {e}")
             st.info(
